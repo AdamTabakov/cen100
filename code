@@ -1,0 +1,323 @@
+"""
+Elevator free-space prototype
+=============================
+Pipeline:  synthetic overhead depth camera -> occupancy mask -> free area
+           -> temporal smoothing -> hysteresis -> stop decision (+ safety overrides)
+
+Run:  python elevator_space.py
+Needs: numpy, matplotlib
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+
+import numpy as np
+
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+@dataclass
+class Config:
+    # Car geometry (metres) and camera grid resolution
+    car_w: float = 1.6
+    car_d: float = 1.4
+    res: float = 0.02               # metres per pixel (the calibration)
+    cam_height: float = 2.3         # overhead camera height above floor
+
+    # Perception
+    height_thresh: float = 0.12     # anything taller than this is "occupied"
+    personal_space: float = 0.10    # m of buffer added around every object
+
+    # Decision
+    a_person: float = 0.25          # m^2 needed to stand one more person
+    a_margin: float = 0.10          # extra safety margin, m^2
+    hysteresis: float = 0.08        # m^2 gap between "skip" and "re-open" thresholds
+    alpha: float = 0.3              # EMA smoothing factor, 0 < alpha < 1
+    max_skips: int = 2              # starvation limit per hall call
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return int(round(self.car_d / self.res)), int(round(self.car_w / self.res))
+
+    @property
+    def cell_area(self) -> float:
+        return self.res ** 2
+
+    @property
+    def floor_area(self) -> float:
+        return self.car_w * self.car_d
+
+    @property
+    def need(self) -> float:
+        return self.a_person + self.a_margin
+
+
+# --------------------------------------------------------------------------- #
+# Simulator: draws people / bags as a top-down depth image
+# --------------------------------------------------------------------------- #
+@dataclass
+class Item:
+    kind: str       # "person" (ellipse) or "bag" (rectangle)
+    x: float        # centre, metres from left wall
+    y: float        # centre, metres from back wall
+    w: float        # footprint width
+    d: float        # footprint depth
+    h: float        # height above floor
+
+
+def person(x, y):
+    return Item("person", x, y, 0.45, 0.30, 1.70)
+
+
+def suitcase(x, y):
+    return Item("bag", x, y, 0.50, 0.30, 0.65)
+
+
+def render_depth(cfg: Config, items: list[Item], rng: np.random.Generator,
+                 noise: float = 0.02, dropout: float = 0.01) -> np.ndarray:
+    """Depth image (metres from camera). Empty floor = cam_height."""
+    H, W = cfg.shape
+    ys, xs = np.mgrid[0:H, 0:W]
+    X, Y = (xs + 0.5) * cfg.res, (ys + 0.5) * cfg.res
+
+    height = np.zeros((H, W))
+    for it in items:
+        if it.kind == "person":
+            m = ((X - it.x) / (it.w / 2)) ** 2 + ((Y - it.y) / (it.d / 2)) ** 2 <= 1
+        else:
+            m = (np.abs(X - it.x) <= it.w / 2) & (np.abs(Y - it.y) <= it.d / 2)
+        height = np.maximum(height, it.h * m)
+
+    depth = cfg.cam_height - height + rng.normal(0, noise, (H, W))
+    bad = rng.random((H, W)) < dropout                  # sensor speckle
+    depth[bad] = cfg.cam_height - rng.uniform(0.3, 1.5, bad.sum())
+    return depth
+
+
+# --------------------------------------------------------------------------- #
+# Perception
+# --------------------------------------------------------------------------- #
+def _shift_stack(m: np.ndarray, fill: bool):
+    p = np.pad(m, 1, constant_values=fill)
+    H, W = m.shape
+    return [p[dy:dy + H, dx:dx + W] for dy in range(3) for dx in range(3)]
+
+
+def erode(m: np.ndarray) -> np.ndarray:
+    return np.logical_and.reduce(_shift_stack(m, True))
+
+
+def dilate(m: np.ndarray) -> np.ndarray:
+    return np.logical_or.reduce(_shift_stack(m, False))
+
+
+def calibrate_reference(cfg: Config, rng, n: int = 20) -> np.ndarray:
+    """Median of several empty-car frames = stored background."""
+    return np.median([render_depth(cfg, [], rng) for _ in range(n)], axis=0)
+
+
+def occupied_mask(depth: np.ndarray, ref: np.ndarray, cfg: Config) -> np.ndarray:
+    height = ref - depth
+    m = height > cfg.height_thresh
+    return dilate(erode(m))                              # opening removes speckle
+
+
+def free_area(mask: np.ndarray, cfg: Config) -> float:
+    """Free floor area in m^2, after reserving personal space around objects."""
+    buffered = mask
+    for _ in range(int(round(cfg.personal_space / cfg.res))):
+        buffered = dilate(buffered)
+    return cfg.floor_area - buffered.sum() * cfg.cell_area
+
+
+# --------------------------------------------------------------------------- #
+# Decision logic
+# --------------------------------------------------------------------------- #
+class Decision(Enum):
+    OPEN = "OPEN"
+    SKIP = "SKIP"
+
+
+@dataclass
+class StopResult:
+    decision: Decision
+    reason: str
+
+
+@dataclass
+class ElevatorController:
+    cfg: Config
+    free_smooth: float | None = None
+    can_board: bool = True                               # hysteresis state
+    skips: dict[int, int] = field(default_factory=dict)  # floor -> times skipped
+
+    def update(self, free_raw: float) -> float:
+        """Call every frame: EMA smoothing + hysteresis state machine."""
+        a = self.cfg.alpha
+        self.free_smooth = (free_raw if self.free_smooth is None
+                            else a * free_raw + (1 - a) * self.free_smooth)
+        lo = self.cfg.need                               # drop below -> stop boarding
+        hi = self.cfg.need + self.cfg.hysteresis         # rise above -> allow boarding
+        if self.can_board and self.free_smooth < lo:
+            self.can_board = False
+        elif not self.can_board and self.free_smooth >= hi:
+            self.can_board = True
+        return self.free_smooth
+
+    def decide_stop(self, floor: int, *, passenger_exiting: bool = False,
+                    emergency: bool = False) -> StopResult:
+        """Call when the car arrives at a floor with a hall call."""
+        # Safety overrides: the camera may only skip a stop for *boarding*.
+        if emergency:
+            return self._open(floor, "emergency/maintenance mode")
+        if passenger_exiting:
+            return self._open(floor, "passenger needs to exit")
+        if self.skips.get(floor, 0) >= self.cfg.max_skips:
+            return self._open(floor, "starvation limit reached")
+
+        if self.can_board:
+            return self._open(floor, "enough free space")
+        self.skips[floor] = self.skips.get(floor, 0) + 1
+        return StopResult(Decision.SKIP, f"car full (skip #{self.skips[floor]})")
+
+    def _open(self, floor: int, reason: str) -> StopResult:
+        self.skips[floor] = 0
+        return StopResult(Decision.OPEN, reason)
+
+
+# --------------------------------------------------------------------------- #
+# Demo 1: static scenes
+# --------------------------------------------------------------------------- #
+# Standing spots roughly filling the car, in order of arrival
+SPOTS = [(0.30, 0.30), (1.30, 0.30), (0.80, 0.30), (0.30, 0.75), (1.30, 0.75),
+         (0.80, 0.75), (0.30, 1.15), (1.30, 1.15), (0.80, 1.15)]
+
+SCENES = {
+    "empty": [],
+    "1 person": [person(*SPOTS[0])],
+    "3 people": [person(*s) for s in SPOTS[:3]],
+    "5 people": [person(*s) for s in SPOTS[:5]],
+    "8 people": [person(*s) for s in SPOTS[:8]],
+    "2 people + suitcase": [person(*SPOTS[0]), person(*SPOTS[1]),
+                            suitcase(0.80, 0.85), suitcase(0.80, 1.15)],
+}
+
+
+def run_scenes(cfg: Config, rng, ref):
+    results = []
+    for name, items in SCENES.items():
+        depth = render_depth(cfg, items, rng)
+        mask = occupied_mask(depth, ref, cfg)
+        ctrl = ElevatorController(cfg)
+        # Feed the same frame a few times so the EMA settles
+        for _ in range(10):
+            ctrl.update(free_area(occupied_mask(render_depth(cfg, items, rng), ref, cfg), cfg))
+        res = ctrl.decide_stop(floor=5)
+        results.append((name, ref - depth, mask, ctrl.free_smooth, res))
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# Demo 2: time sequence (boarding, then leaving) with flicker
+# --------------------------------------------------------------------------- #
+def run_sequence(cfg: Config, rng, ref, n_frames: int = 150):
+    ctrl = ElevatorController(cfg)
+    enter = [5 + 9 * i for i in range(8)]                # arrival frames (last at 68)
+    leave = [100 + 4 * i for i in range(8)]              # departure frames (car full 68-100)
+    log = []
+    for t in range(n_frames):
+        items = [person(*SPOTS[i]) for i in range(8) if enter[i] <= t < leave[i]]
+        if rng.random() < 0.08:                          # a swinging bag, one frame only
+            items.append(suitcase(rng.uniform(0.3, 1.3), rng.uniform(0.3, 1.1)))
+        raw = free_area(occupied_mask(render_depth(cfg, items, rng), ref, cfg), cfg)
+        smooth = ctrl.update(raw)
+        log.append((t, raw, smooth, ctrl.can_board, len(items)))
+    return log
+
+
+# --------------------------------------------------------------------------- #
+# Demo 3: override rules
+# --------------------------------------------------------------------------- #
+def run_overrides(cfg: Config, rng, ref):
+    items = [person(*s) for s in SPOTS[:8]]              # full car
+    ctrl = ElevatorController(cfg)
+    for _ in range(10):
+        ctrl.update(free_area(occupied_mask(render_depth(cfg, items, rng), ref, cfg), cfg))
+    cases = [
+        ("hall call floor 7, car full",          dict(floor=7)),
+        ("hall call floor 7 again",              dict(floor=7)),
+        ("hall call floor 7 (3rd time)",         dict(floor=7)),
+        ("floor 3, passenger inside exits here", dict(floor=3, passenger_exiting=True)),
+        ("floor 9, emergency mode",              dict(floor=9, emergency=True)),
+    ]
+    return [(label, ctrl.decide_stop(**kw)) for label, kw in cases]
+
+
+# --------------------------------------------------------------------------- #
+# Reporting
+# --------------------------------------------------------------------------- #
+def make_figure(cfg, scenes, seq, path="elevator_demo.png"):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(13, 8.5))
+    gs = fig.add_gridspec(3, 6, height_ratios=[1.1, 1.1, 1.4])
+
+    for i, (name, height, mask, free, res) in enumerate(scenes):
+        ax = fig.add_subplot(gs[i // 3, (i % 3) * 2:(i % 3) * 2 + 2])
+        ax.imshow(height, cmap="viridis", vmin=0, vmax=1.8)
+        ax.contour(mask, levels=[0.5], colors="w", linewidths=1)
+        colour = "tab:green" if res.decision is Decision.OPEN else "tab:red"
+        ax.set_title(f"{name}\nfree = {free:.2f} m²  →  {res.decision.value}",
+                     color=colour, fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+
+    t = [r[0] for r in seq]
+    raw = [r[1] for r in seq]
+    smooth = [r[2] for r in seq]
+    board = [r[3] for r in seq]
+    ax = fig.add_subplot(gs[2, :])
+    ax.plot(t, raw, color="lightgray", label="raw free area")
+    ax.plot(t, smooth, color="tab:blue", label="smoothed (EMA)")
+    ax.axhline(cfg.need, color="tab:red", ls="--", label="skip below")
+    ax.axhline(cfg.need + cfg.hysteresis, color="tab:green", ls="--", label="re-open above")
+    ax.fill_between(t, 0, 1, where=[not b for b in board], color="tab:red", alpha=0.12,
+                    transform=ax.get_xaxis_transform(), label="would SKIP")
+    ax.set_xlabel("frame"); ax.set_ylabel("free area (m²)")
+    ax.set_title("People board, then leave: smoothing + hysteresis keep the decision stable")
+    ax.legend(ncol=5, fontsize=8, loc="upper center")
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    return path
+
+
+def main():
+    cfg = Config()
+    rng = np.random.default_rng(42)
+    ref = calibrate_reference(cfg, rng)
+
+    print(f"Car {cfg.car_w}x{cfg.car_d} m = {cfg.floor_area:.2f} m²,  "
+          f"grid {cfg.shape[1]}x{cfg.shape[0]} px,  need {cfg.need:.2f} m²\n")
+
+    print("== Static scenes ==")
+    scenes = run_scenes(cfg, rng, ref)
+    for name, _, _, free, res in scenes:
+        print(f"  {name:<22} free={free:5.2f} m²  {res.decision.value:<5} ({res.reason})")
+
+    print("\n== Overrides ==")
+    for label, res in run_overrides(cfg, rng, ref):
+        print(f"  {label:<40} {res.decision.value:<5} ({res.reason})")
+
+    seq = run_sequence(cfg, rng, ref)
+    flips = sum(1 for a, b in zip(seq, seq[1:]) if a[3] != b[3])
+    print(f"\n== Sequence ==\n  {len(seq)} frames, boarding state changed {flips} times "
+          "(expected 2: full, then room again)")
+
+    print("\nSaved", make_figure(cfg, scenes, seq))
+
+
+if __name__ == "__main__":
+    main()
